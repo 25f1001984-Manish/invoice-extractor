@@ -1,18 +1,14 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from transformers import pipeline
-import json
+from dateutil import parser
 import re
 
-app = FastAPI()
+app = FastAPI(title="Invoice Extractor")
 
-extractor = pipeline(
-    "text2text-generation",
-    model="google/flan-t5-base"
-)
 
 class InvoiceRequest(BaseModel):
     text: str
+
 
 class InvoiceResponse(BaseModel):
     vendor: str
@@ -21,89 +17,96 @@ class InvoiceResponse(BaseModel):
     date: str
 
 
+@app.get("/")
+def home():
+    return {"message": "Invoice Extractor Running"}
+
+
 @app.post("/extract", response_model=InvoiceResponse)
 def extract(req: InvoiceRequest):
 
-    if not req.text.strip():
+    text = req.text.strip()
+
+    if not text:
         raise HTTPException(status_code=422, detail="Empty input")
 
-    prompt = f"""
-Extract invoice information.
+    # -------------------------
+    # Currency
+    # -------------------------
 
-Return ONLY JSON.
+    currency = ""
 
-Fields:
-vendor
-amount
-currency
-date
+    currency_match = re.search(r"\b(USD|EUR|GBP)\b", text, re.I)
 
-Invoice:
+    if currency_match:
+        currency = currency_match.group(1).upper()
 
-{req.text}
-"""
+    # -------------------------
+    # Amount
+    # -------------------------
 
-    result = extractor(
-        prompt,
-        max_new_tokens=128
-    )[0]["generated_text"]
+    amount = 0.0
 
-    try:
-        json_text = re.search(r"\{.*\}", result, re.S).group()
-        data = json.loads(json_text)
+    amount_patterns = [
+        r"(?:Total Due|Amount Due|Total|Balance Due|Grand Total)\D*([0-9]+(?:\.[0-9]{1,2})?)",
+        r"\b(?:USD|EUR|GBP)\s*([0-9]+(?:\.[0-9]{1,2})?)",
+        r"([0-9]+(?:\.[0-9]{1,2})?)"
+    ]
 
-        return InvoiceResponse(
-            vendor=data["vendor"],
-            amount=float(data["amount"]),
-            currency=data["currency"].upper(),
-            date=data["date"]
-        )
+    for pattern in amount_patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            amount = float(m.group(1))
+            break
 
-    except Exception:
+    # -------------------------
+    # Date
+    # -------------------------
 
-        vendor = ""
+    date = ""
 
-        amount = 0
+    date_patterns = [
+        r"\b20\d{2}-\d{2}-\d{2}\b",
+        r"\b\d{2}/\d{2}/20\d{2}\b",
+        r"\b\d{2}-\d{2}-20\d{2}\b",
+        r"\b[A-Za-z]+\s+\d{1,2},\s*20\d{2}\b"
+    ]
 
-        currency = ""
+    for pattern in date_patterns:
+        m = re.search(pattern, text)
+        if m:
+            try:
+                date = parser.parse(m.group()).strftime("%Y-%m-%d")
+                break
+            except:
+                pass
 
-        date = ""
+    # -------------------------
+    # Vendor
+    # -------------------------
 
-        vendor_match = re.search(
-            r"(?:Invoice from|Vendor|From)\s*[:\-]?\s*(.+)",
-            req.text,
-            re.I,
-        )
+    vendor = ""
 
-        if vendor_match:
-            vendor = vendor_match.group(1).split("\n")[0].strip()
+    vendor_patterns = [
+        r"Invoice from\s*:?(.+)",
+        r"Vendor\s*:?(.+)",
+        r"From\s*:?(.+)"
+    ]
 
-        amount_match = re.search(
-            r"(USD|EUR|GBP)?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            req.text,
-        )
+    for pattern in vendor_patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            vendor = m.group(1).split("\n")[0].strip(" .,:")
+            break
 
-        if amount_match:
-            amount = float(amount_match.group(2))
-            if amount_match.group(1):
-                currency = amount_match.group(1)
+    if vendor == "":
+        lines = [i.strip() for i in text.split("\n") if i.strip()]
+        if lines:
+            vendor = lines[0]
 
-        date_match = re.search(
-            r"(2026-\d{2}-\d{2})",
-            req.text,
-        )
-
-        if date_match:
-            date = date_match.group(1)
-
-        return InvoiceResponse(
-            vendor=vendor,
-            amount=amount,
-            currency=currency,
-            date=date,
-        )
-
-
-@app.get("/")
-def home():
-    return {"status": "running"}
+    return InvoiceResponse(
+        vendor=vendor,
+        amount=amount,
+        currency=currency,
+        date=date
+    )
